@@ -1,0 +1,403 @@
+---
+title: "Template for Part 1 of clumped data processing"
+author: "Brett & Katie"
+date: "May 2019"
+output: html_document
+---
+
+Code version: updated May 31,2019
+
+MANUALLY UPDATE: user defined, session-specific information
+```{r manual-definitions}
+User <- "YOUR NAME HERE"
+session <-"YOUR SESSION NAME HERE"  #change this to whatever name or number you want to give you session, is appended on to plot titles and spreadsheet output so that everything is session specific, including file names
+MS.ID<-"Bert"   #don't change this unless we get a new mass spec or you are using this for data from another lab :)   
+
+```
+
+## Install custom packages
+These will change frequently over the next couple of years, so it is wise to reinstall them everytime, to be sure you are using the up-to-date versions of the functions that the code below needs. If there haven't been any changes to the codes, it will say that and not reinstall them.
+```{r install, eval = FALSE}
+devtools::install_github("KopfLab/isoreader")
+
+devtools::install_github("cubessil/isoprocessCUBES") #general CUBESsil lab stuff
+
+devtools::install_github("cubessil/CUBESSILclumpedmath") #only for processing clumped data
+
+```
+
+## Load libraries and clumped isotope standard values
+
+```{r message = FALSE, warning = FALSE}
+library(rlang)
+library(plotly)
+library(isoreader)
+library(tidyverse)
+library(isoprocessCUBES)
+library(CUBESSILclumpedmath)
+
+Standards <- readRDS(url("https://github.com/cubessil/clumpsDRcodes/blob/master/Standards_070319.RDS?raw=true"))
+#ProjectIDs <- read.csv("ProjectIDs.csv")  IMPLEMENT - lets start a data file of sample IDs and Project IDS, so we can leave this out of the functions, but have a good cross platform, can store as RDS and read it in from github as well....
+```
+
+## Load all did files in a folder (or multiple folders)
+
+Catches any errors and exceptions that might occur and reports them as "problems".
+```{r load-data}
+readrawdata <- TRUE
+if (readrawdata){
+folder <- file.path(".")
+  stopifnot(file.exists(folder))
+  tictoc::tic()
+  did_files <- iso_read_dual_inlet(folder,cache = TRUE, quiet = FALSE, read_vendor_data_table = TRUE, parallel = TRUE)
+  tictoc::toc()
+  did_files <- iso_filter_files_with_problems(did_files)  
+  saveRDS(did_files, paste0(session, "_did_files.RDS"))
+}else{
+  did_files <- readRDS(paste0(session, "_did_files.RDS"))
+}
+
+  rawdata <- prep_didfiles(did_files)
+  
+  #code example for fixing batching problems when making the flatlist.cyc dataframe:
+  #rawdata[  rawdata$Analysis > 30115 & rawdata$Analysis < 30125, "Preparation"] <- "D" #to fix two back to back dR_1000 that didn't have different preparation labels and so didn't batch correctly
+```
+#clump math
+```{r clumped-math-cycles}
+  flatlist.Cyc <- clumpedbyCyc(rawdata)
+  #flatlist.Cyc.017 <- clumpedbyCyc(rawdata, lambda = 0.528) #for illustration purposes only
+
+#this plots batch versus id, and is colored by Identifier 1. This is a visual way to assess if all the samples were correctly batch. Watch samples with an abnormal number of cycles (ie, id number) and different colors, which suggests that samples didn't get binned correctly or there are 2 samples with the same name in a row that are being counted as a single sample (e.g. running 2 of the same heated gas or standard in a row)
+batching <- flatlist.Cyc %>%
+  ggplot(aes(x=batch, y=id, fill = `Identifier 1`)) +
+  geom_point(size = 3, shape = 21) +
+  theme_bw()
+
+ggplotly(batching)
+
+unique(flatlist.Cyc$`Identifier 1`)  #shows all unique sample ID names, so easy to see if there are inconsistencies that need to be fixed in the next box
+```
+
+#change names, add comments, and Donotuse
+```{r  fix-label-mistakes}
+#Code examples: 
+#flatlist.Cyc[  flatlist.Cyc$Analysis > 28131 & flatlist.Cyc$Analysis < 28139.8, "Identifier 1"] <- "all$dR_1000"  
+#flatlist.Cyc[ flatlist.Cyc$`Identifier 1` == "KB_CI_576; EBOC" , "Identifier 1"] <- "eBOC_1000"
+#flatlist.Cyc <- getmetadatafromAnalysis(flatlist.Cyc, 28207, 28215.7, 28198) #Can use this function to shift the metadata from one set of analysis numbers to another set; useful for occasions like carousel glitches or starting the sequence on the wrong line that result in the wrong sample information for a given sample
+
+```
+
+#Add more outlier test
+```{r}
+flatlist.Cyc <- flatlist.Cyc %>%   ##prep dataframe, could be function but users should be able to make new outlier col
+  group_by(batch) %>%  
+  mutate(D47full.stdev = sd(D47full), D47full.mean =mean(D47full),
+              D47.outlier.1sig = abs(D47full.mean-D47full)>abs(D47full.stdev*1), 
+              D47.outlier.2sig = abs(D47full.mean-D47full)>abs(D47full.stdev*2),
+              D47.outlier.3sig = abs(D47full.mean-D47full)>abs(D47full.stdev*3),
+              nooutlier = FALSE)
+
+```
+#Yield Plots and signal
+Goal in these plots it to find samples or gases with too little gas that should not be used. 1st plot shows all cycles for all acquisitions. Yield values after the first acquistion are equivalent to the percent bellows compression. If there is enough gas, "yield" should increase after the first acquisition, and then should consistently drop after each acquisition. The lower plot shows just the first acquisition. The scond plot shows mass versus yield; samples that have <100% carbonate or have a yield issue (ie, not complete reaction) will fall off the main line. Everything a zero is a reference gas. The last plot is mass 44 versus analysis. Samples that do not have enough sample to run will eventually stop making it to 12.5 volts.
+```{r yield, fig.width = 20}
+
+pYield.all <- flatlist.Cyc %>%
+  ggplot(aes(x=Analysis, y=Yield, fill = `Preparation`)) +
+  geom_point(shape = 21)
+
+pYield.firstacq <- flatlist.Cyc %>%
+  filter(Method == "Start and Transfer.met") %>%
+  ggplot(aes(x=Analysis, y=Yield, fill = `Preparation`)) +
+  geom_point(shape = 21)
+
+pYieldVmass <- flatlist.Cyc %>%
+  filter(Method == "Start and Transfer.met" & 'Identifier 2' != 0) %>%
+  ggplot(aes(x=as.numeric(`Identifier 2`), y=Yield, fill = `Preparation`, label = `Analysis`)) +
+  geom_point(shape = 21)
+
+pM44mv <- flatlist.Cyc %>% 
+  ggplot(aes(x=Analysis, y=v44.mV, fill=`Preparation`, label=`Identifier 1`)) + 
+  geom_point(shape = 21)
+  
+
+subplot(pYield.all, pYield.firstacq, nrows = 2)
+ggplotly(pYieldVmass)
+ggplotly(pM44mv)
+```
+
+#add comments and Donotuse
+```{r label-remove-yield-problems}
+#Example code:
+# flatlist.Cyc <- flatlist.Cyc %>% 
+#   change.donotuse.and.runinfo(27150,27820,TRUE,"omg BRettt") 
+
+#note that when using Analysis numbers from the flatlist.Cyc dataframe, the analyses include .1 to .7 at the end of each number. So, you need to account for that when defining the ranges. The function is set to read <= and >= for the upper and lower bounds, respectively.
+
+
+```
+
+look at bulk isotopes - look for major fliers or samples with large variability
+```{r bulkisos-big}
+pd18O <- flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=Analysis, y=d18O, fill=`Preparation`)) + geom_point()
+  
+pd13C <- flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=Analysis, y=d13C, fill=`Preparation`)) + geom_point()
+  
+subplot(pd18O,pd13C,nrows = 2) 
+```
+
+look at plots of all cycles for individual samples versus analysis number for d13C, d18O, d13C V d18O, and D47 versus analysis number. Looking for outlier cycles or acquisition, acquisitions with high variability relative to others in the sample, and other analytical problems (e.g. correlation between d13C and d18O, strong trends in values at the cycle and/or acquisition level)
+```{r cyc-samples-bulkisos, fig.height= 20, fig.width=30}
+
+d18O.mean <- flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  calc_means("d18O", "batch", "Identifier 1")
+
+p.ind.d18O <- flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot() + 
+  geom_hline(
+    data = d18O.mean,
+    mapping = aes(yintercept = yintercept, linetype = linetype, color = id)) +
+  geom_point(aes(x=Analysis, y=d18O, fill = `Identifier 1`, shape = D47.outlier.2sig)) +
+  scale_linetype_manual(values = c(1, 3, 2, 3, 2)) + 
+  scale_shape_manual(values = c(21,24)) +
+  facet_wrap(.~batch, scales = "free") +
+  theme_bw() +
+  guides(linetype = "none")
+
+d13C.mean <- 
+  flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  calc_means("d13C", "batch", "Identifier 1")
+
+p.ind.d13C <- flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot() + 
+  geom_hline(
+    data = d13C.mean,
+    mapping = aes(yintercept = yintercept, linetype = linetype, color = id)) +
+  geom_point(aes(x=Analysis, y=d13C, fill = `Identifier 1`, shape = D47.outlier.2sig)) +
+  scale_linetype_manual(values = c(1, 3, 2, 3, 2)) + 
+  scale_shape_manual(values = c(21,24)) +
+  facet_wrap(.~batch, scales = "free") +
+  theme_bw() +
+  guides(linetype = "none")
+
+p.ind.d13Cvd18O <- flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=d18O, y=d13C, fill=`Identifier 1`)) + 
+  geom_point(aes(shape = , shape = D47.outlier.2sig)) +
+  scale_shape_manual(values = c(21,24)) +
+  facet_wrap(.~batch, scales = "free") +
+  theme_bw()
+
+D47.mean <- 
+  flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  calc_means("D47full", "batch", "Identifier 1")
+
+p.ind.D47 <- flatlist.Cyc %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot() + 
+  geom_hline(
+    data = D47.mean,
+    mapping = aes(yintercept = yintercept, linetype = linetype, color = id)) +
+  geom_point(aes(x=Analysis, y=D47full, fill = `Identifier 1`, shape = D47.outlier.2sig)) +
+  scale_linetype_manual(values = c(1, 3, 2, 3, 2)) + 
+  scale_shape_manual(values = c(21,24)) +
+  facet_wrap(.~batch, scales = "free") +
+  theme_bw() +
+  guides(linetype = "none")
+
+p.ind.d18O
+p.ind.d13C
+p.ind.d13Cvd18O
+p.ind.D47
+```
+
+ID analysis number that correspond to problematic batch numbers, to make the donotuse labelling process easier
+```{r ID-analysis-batch}
+
+
+
+```
+
+
+Plotting d18O and d13C by ID 
+```{r bulk-crossplot-eachID 1, fig.height= 20, fig.width=20}
+ flatlist.Cyc %>%
+  filter(Donotuse != TRUE) %>% 
+  ggplot(aes(x=d18O, y=d13C, color=Preparation, label = Analysis)) + 
+  geom_point()+
+  facet_wrap(~ `Identifier 1` , scales = "free") +
+  theme_bw()
+```
+
+Plotting D47 and d47 by ID
+```{r d47-D47-eachID 1, fig.height= 20, fig.width=20}
+flatlist.Cyc %>%
+  filter(Donotuse != TRUE) %>% 
+  ggplot(aes(x=d47, y=D47full, color=Preparation, label=Analysis)) + 
+  geom_point()+
+  facet_wrap(~ `Identifier 1` , scales = "free")+
+  theme_bw()
+```
+
+
+#add more comments and Donotuse, based on analytical issues and major outliers
+```{r label-remove-analytical-problems}
+#Example code:
+# flatlist.Cyc <- flatlist.Cyc %>% 
+#   change.donotuse.and.runinfo(28065.1,28065.3,TRUE,"not enough gas to run")
+
+```
+
+#clumped math with any outlier or for that mater the any bool
+```{r clumped math with outlier}
+
+flatlist.Acq <- flatlist.Cyc %>%
+  filter(Donotuse != TRUE) %>%
+  clumpedCyctoAcquisition()
+
+flatlist.Acq.outlier<- flatlist.cyc.outlier(flatlist.Cyc, "Donotuse")
+
+write.csv(flatlist.Acq, paste0(session, "_flatlist.Acq.csv"))
+```
+
+looking at bulk isotope stdev at the acquisition level
+```{r d18Ostd and d13Cstd}
+pd18O <- flatlist.Acq %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=Analysis, y=d18O.stdev)) + 
+  stat_smooth(method = "lm") +
+  geom_point(aes(color=Preparation))
+  
+pd13C <- flatlist.Acq %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=Analysis, y=d13C.stdev)) + 
+  stat_smooth(method = "lm") +
+  geom_point(aes(color=`Preparation`))
+  
+subplot(pd18O,pd13C, nrows = 2) 
+```
+
+```{r D47std}
+pD47 <- flatlist.Acq %>%
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=Analysis, y=D47.stdev, color=`Preparation`)) + 
+  geom_point()
+  
+pD47.date <- flatlist.Acq %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=file_datetime, y=D47.stdev, color=`Preparation`)) + 
+  geom_point()
+  
+subplot(pD47,pD47.date,nrows = 2) 
+```
+
+```{r acqs-histograms}
+histograms <- flatlist.Acq %>%
+  filter(Donotuse != TRUE) %>%
+  gather(isotope, stdev, d13C.stdev, d18O.stdev, d47.stdev, d48.stdev, D47.stdev, D48.stdev) 
+  
+acq.sd <- histograms %>%
+  ggplot() +
+  geom_histogram(aes(x=stdev, fill=isotope), binwidth = .05) +
+  facet_wrap(isotope~., scales= "free")
+
+acq.sd2 <- histograms %>% filter(stdev < 2) %>%
+  ggplot() +
+  geom_histogram(aes(x=stdev, fill=isotope), binwidth = .001) +
+                   facet_wrap(isotope~., scales= "free")
+
+acq.sd
+acq.sd2
+```
+
+```{r D48 no zoom}
+pD48 <- flatlist.Acq %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=file_datetime, y=D48full, color=`Preparation`, label = Identifier1)) + 
+  geom_point() 
+
+pd48 <- flatlist.Acq %>% 
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=file_datetime, y=d48.stdev, color=`Preparation`, label = Identifier1)) + 
+  geom_point()
+
+subplot(pD48,pd48,nrows = 2) 
+```
+
+```{r last_culling}
+#last call for culling more samples, same syntax as above
+
+```
+
+
+## Makes a new flatlist with each line as a sample for use in part 2 of the data processing procedures
+```{r}
+standards.names <- c("TV04","Carrara.CIT", "ETH1","ETH2","ETH3")
+
+
+flatlist.Sam <- flatlist.Acq %>% 
+  filter(Donotuse != TRUE) %>%
+  group_by(batch.Aq) %>% 
+  summarise(
+                     Project = sub("\\$.*","", sub("//$.*", "", `Identifier1`))[1],
+                     User ="", 
+                     Date = file_datetime[1],
+                     Session = "NA",
+                     Sample.ID = sub(".*\\$","", sub(".*//$", "", `Identifier1`))[1],
+                     Type = if  (Sample.ID %in% standards.names){
+                                "standard"
+                                }
+                            else if (sub(".*_", "", Sample.ID) == "25")
+                            {
+                              "equilibrated gas"
+                            }
+                            else if (sub(".*_", "", Sample.ID) == "1000")
+                            {
+                              "heated gas"
+                            }
+                            else{
+                              "sample"
+                            },
+                     Donotuse = Donotuse[1],
+                     runinfo = runinfo[1],
+                     spec.num = Analysis[1], 
+                     mass=as.numeric(`Identifier2`[1]),
+                     num.acq=n(),
+                     Preparation = Preparation[1], 
+                     Yield = Yield[1], 
+                     Method = Method[1],
+                     d45.stdev= sd(d45),
+                     d45 = mean(d45),
+                     d46.stdev= sd(d46),
+                     d46 = mean(d46),
+                     d47.stdev= sd(d47),
+                     d47 = mean(d47),
+                     d48.stdev = sd(d48),
+                     d48 = mean(d48),
+                     d49.stdev = sd(d49),
+                     d49 = mean(d49),
+                     D47.stdev = sd(D47full),
+                     D47= mean(D47full),
+                     D48.stdev = sd(D48full), 
+                     D48= mean(D48full), 
+                     d13C.stdev= sd(d13C), 
+                     d13C =  mean(d13C), 
+                     d18O.stdev= sd(d18O),
+                     d18O.SMOW.gas = mean(d18O),
+                     d18O.VPDB.min = ((((d18O.SMOW.gas-30.86)/1.03086)+1000)/1.00821)-1000, #acid fac and SMOW to PDB conversion
+                     PB= mean(PB), 
+                     LeftPressure= mean(LeftPressure),
+                     RightPressure = mean(LeftPressure)
+                     )
+
+write.csv(flatlist.Sam, paste0(session, "_flatlist.csv"))
+```

@@ -1,0 +1,697 @@
+CUBES-SIL Clumped CO2 data processing
+========================================================
+##### code by Katie Snell, updated 07/03/2019
+
+--------------------------------------------------------
+
+To do list:
+
+* Should we be using york regressions for all the lines? E.g., including std correction lines, ARF ETFs - probably 
+    * have a test version in there (actual ARF values are still based on the linear model), but I'm not sure what to do about the fact that we don't have errors for the y values. Can't run it with "0" as errors, and with very small errors, is effectively the same as the standard linear model
+* Make error contours for D47 line, like Mathieu's web app?
+* correct d13C and d18O values
+
+### Data processing Scheme
+
+1. Read data and cull samples with known analytical problems
+2. Determine D48 excess and label samples  
+    Calculates "true" values relative to HG, then assigns "clean", "maybe", and "dirty" based on theoretical separate between HG line and EG line of 0.4
+3. Make heated gas D47 line from data with no D48 excess
+4. Calculate external D47 errors (includes error from heated gas line)
+5. Initial data corrections: HG line, stretching, internal acid digestion correction
+6. Absolute Reference Frame  
+    6.1. Make ETF lines from data with no D48 excess and calculate ARF D47 values  
+    **6.1.1:** Primary Approach - uses heated and equilibrated gases    
+    **6.1.2:** Secondary Approach -uses standards 
+    6.2. Calculate standard residuals from ARF D47 values  
+    6.3. Standard corrections for ARF D47 values from data with no D48 excess using a line between the standards    
+    6.4. Calculate temperatures from acid digestion corrected values, and all std corrected columns  
+
+Data processing code
+---------------------
+
+### 1. Load data, packages and cull samples with known analytical problems
+
+MANUALLY UPDATE: input your file namge and give the session a name
+```{r load-data}
+User <- "XXXXX"
+session <-"XXXXXX"  #change this to whatever name or number you want to give you session
+MS.ID<-"Bert"   
+
+data <- read.csv("XXXXXXX.csv")
+data$MS <- MS.ID
+```
+
+load necessary R libraries and clumped isotope standards data
+```{r load-stuff}
+devtools::install_github("cubessil/CUBESSILclumpedmath") #general CUBESsil lab stuff
+#devtools::install_github("cubessil/clumpsDRtools") #only for processing clumped data
+
+library(plotly)
+library(shiny)
+library(isoprocessCUBES)
+library(tidyverse)
+library(CUBESSILclumpedmath)
+#library(clumpsDRtools)
+
+Standards <- readRDS(url("https://github.com/cubessil/clumpsDRcodes/blob/master/Standards_070319.RDS?raw=true"))
+```
+
+Fixing name mistakes, subset data to project, drop remaining unrelated samples
+```{r fix-mistakes}
+data <- filter(data, Project != "NA")
+```
+
+Calculate internal standard errors of the mean for each column of isotope data, using number of acq for each sample
+```{r calc-int-stderr}
+data$d48.sterr<-round(data$d48.stdev/sqrt(data$num.acq), 4)
+data$D48.sterr<-round(data$D48.stdev/sqrt(data$num.acq), 4)
+data$d47.sterr<-round(data$d47.stdev/sqrt(data$num.acq), 4)
+data$D47.sterr<-round(data$D47.stdev/sqrt(data$num.acq), 4)
+data$d13C.sterr<-round(data$d13C.stdev/sqrt(data$num.acq), 4)
+data$d18O.sterr<-round(data$d18O.stdev/sqrt(data$num.acq), 4)
+data$d45.sterr<-round(data$d45.stdev/sqrt(data$num.acq), 4)
+data$d46.sterr<-round(data$d46.stdev/sqrt(data$num.acq), 4)
+```
+
+### 2. Determine D48 excess and label samples  
+#### Use all HQ and EQ gas data to determine D48 excess  
+    * Optional step **not applied**: repeat D48 excess determination after D48 excess removed
+
+Define D48 HG dataframe for 48 line (exclude samples with analytical problems, run initial york regression, use results to calculate more realistic errors, then perform final york regression)
+```{r D48data}
+HG48data <- data %>% 
+  filter(Donotuse != TRUE & Type=="heated gas") %>%
+  select(Sample.ID, num.acq, Donotuse, spec.num, d48, D48, D48.sterr, d48.sterr)
+
+D48line.initial <- cbind(data.frame(Session=session, MS=MS.ID, line.ID="initial D48line"), york.regression(HG48data$d48, HG48data$d48.sterr, HG48data$D48, HG48data$D48.sterr))
+
+HG48data<-calc_exterr(HG48data, 48, D48line.initial$york.slope, D48line.initial$york.intercept, D48line.initial$N)
+
+D48line.final <- cbind(data.frame(Session=session, MS=MS.ID, line.ID="final D48line"), york.regression(HG48data$d48, HG48data$d48exterr, HG48data$D48, HG48data$D48exterr))
+
+D48lines<-rbind(D48line.initial, D48line.final)
+print(D48lines)
+```
+
+Calculate D48 HG corrected values using line and predictive and confidence intervals for D48 regression (note D48 excess values = D48 HG corrected values IF the 48 line used to define excess is only made up of HGs). Also, use this approach when there is no equilibrated gas to define the upper bound; here we use theoretical bound of 0.4 as the upper EG value.
+```{r calc-D48excess}
+D48data <- data %>% 
+  select(Sample.ID, num.acq, spec.num, Type, Donotuse, d48, D48, D48.sterr, d48.sterr)
+
+D48data<-york.conf.pred.interval(HG48data, D48data, 48, D48line.final$york.slope, D48line.final$york.intercept, 0.95)
+
+D48data$D48.HGcorr <- D48data$D48 - (D48data$d48 * D48line.final$york.slope + D48line.final$york.intercept)
+
+D48data$D48excess.label <= "no D48 excess"
+
+D48data <- D48data %>%
+mutate(D48excess.label = ifelse(D48.HGcorr >= 0.345 & D48.HGcorr <= 0.345 + D48.pred.int, "maybe D48 excess", 
+                                ifelse(D48.HGcorr > 0.345 + D48.pred.int, "D48 excess", "no D48 excess")))
+
+data <- full_join(data, select(D48data, spec.num, D48.HGcorr, D48excess.label), by = "spec.num")
+
+```
+
+Plot and save heated gas 48 line with confidence and predictive intervals
+```{r plot-D48excess_time, fig.width=16, fig.height=12}
+
+# colored by 48 excess, shaped by type
+D48.excess1_time<-ggplot(filter(D48data, Donotuse  !=TRUE), aes(x=d48, y=D48)) +
+  geom_ribbon(aes(ymin=all.predicted.Y-D48.pred.int, ymax=all.predicted.Y+D48.pred.int), fill="gray") +
+  geom_ribbon(aes(ymin=all.predicted.Y-D48.conf.int, ymax=all.predicted.Y+D48.conf.int), fill="white") +
+  geom_abline(data=D48line.final, aes(slope=york.slope, intercept=york.intercept), size=0.5) +
+  geom_point(aes(colour=D48excess.label), size=3) +
+  geom_point(aes(shape=Type, fill=D48excess.label), size=3.5) +
+  scale_shape_manual(values=c(21,22,24,25,23)) +
+  annotate("text", x = -20, y = 29, label = york_eqn(D48line.final$york.slope, D48line.final$york.intercept), size = 4, hjust=0, vjust=0, parse=TRUE) +
+  guides(fill=FALSE) +
+  theme_bw() + 
+  labs(title= paste0(session, " D48 line"))
+
+# colored by type, shaped by 48 excess
+D48.excess2_time<-ggplot(filter(D48data, Donotuse  !=TRUE), aes(x=d48, y=D48)) +
+  geom_ribbon(aes(ymin=all.predicted.Y-D48.pred.int, ymax=all.predicted.Y+D48.pred.int), fill="gray") +
+  geom_ribbon(aes(ymin=all.predicted.Y-D48.conf.int, ymax=all.predicted.Y+D48.conf.int), fill="white") +
+  geom_abline(data=D48line.final, aes(slope=york.slope, intercept=york.intercept), size=0.5) +
+  geom_point(aes(colour=Type), size=3) +  
+  geom_point(aes(fill=Type, shape=D48excess.label), size=3.5) +
+  scale_shape_manual(values=c(21,22,24,25,23)) +
+  annotate("text", x = -20, y = 29, label = york_eqn(D48line.final$york.slope, D48line.final$york.intercept),  size = 4, hjust=0, vjust=0, parse=TRUE) +
+  guides(fill=FALSE) +
+  theme_bw() + 
+  labs(title= paste0(session, " all data D48 line, by type")) 
+
+D48.excess3_time<-ggplot(filter(D48data, Donotuse  !=TRUE), aes(x=d48, y=D48)) +
+  geom_ribbon(aes(ymin=all.predicted.Y-D48.pred.int, ymax=all.predicted.Y+D48.pred.int), fill="gray") +
+  geom_ribbon(aes(ymin=0.4+all.predicted.Y-D48.pred.int, ymax=0.4+all.predicted.Y+D48.pred.int), fill="light blue") +
+  geom_abline(data=D48line.final, aes(slope=york.slope, intercept=york.intercept), size=0.5) +
+  geom_abline(data=D48line.final, aes(slope=york.slope, intercept=0.4+york.intercept), size=0.5, color = "blue") +
+  geom_point(aes(colour=D48excess.label), size=3) +
+  geom_point(aes(shape=Type, fill=D48excess.label), size=3.5) +
+  scale_shape_manual(values=c(21,22,24,25,23)) +
+  annotate("text", x =-40, y = 5, label = york_eqn(D48line.final$york.slope, D48line.final$york.intercept),  size = 4, hjust=0, vjust=0, parse=TRUE) +
+  guides(fill=FALSE) +
+  theme_bw() + 
+  labs(title= paste0(session, " D48 line"))
+
+# colored by type, shaped by 48 excess
+D48.excess4_time<-ggplot(filter(D48data, Donotuse  !=TRUE), aes(x=d48, y=D48)) +
+  geom_ribbon(aes(ymin=all.predicted.Y-D48.pred.int, ymax=all.predicted.Y+D48.pred.int), fill="gray") +
+  geom_ribbon(aes(ymin=all.predicted.Y-D48.conf.int, ymax=all.predicted.Y+D48.conf.int), fill="white") +
+  geom_abline(data=D48line.final, aes(slope=york.slope, intercept=york.intercept), size=0.5) +
+  geom_point(aes(colour=Type), size=3) +  
+  geom_point(aes(fill=Type, shape=D48excess.label), size=3.5) +
+  scale_shape_manual(values=c(21,22,24,25,23)) +
+  annotate("text", x = -40, y = 5, label = york_eqn(D48line.final$york.slope, D48line.final$york.intercept),  size = 4, hjust=0, vjust=0, parse=TRUE) +
+  guides(fill=FALSE) +
+  theme_bw() + 
+  labs(title= paste0(session, " all data D48 line, by type")) 
+
+multiplot(D48.excess1_time, D48.excess2_time, D48.excess3_time, D48.excess4_time, cols=2)
+
+
+```
+
+### 2.b Create CDES reference frame values for D48 HG corrected values
+```{r calc-CDES48functions.pri}
+CDES48line.pri <- data %>%
+  filter(D48excess.label=="no D48 excess")%>%
+  filter(Donotuse != TRUE & Type=="heated gas" | Type=="equilibrated gas") %>%
+  left_join(select(Standards, Sample.ID, D48.CDES.90.acc), by = "Sample.ID")
+
+CDES.48slope.pri <- (coef(lm(CDES48line.pri$D48.CDES.90.acc ~ CDES48line.pri$D48.HGcorr))[[2]])
+CDES.48intercept.pri <- (coef(lm(CDES48line.pri$D48.CDES.90.acc ~ CDES48line.pri$D48.HGcorr))[[1]])
+
+data$CDES.48noAD.pri <- CDES.48slope.pri*data$D48.HGcorr+CDES.48intercept.pri #calculates pre-Acid digestion corrected CDES values
+
+#calculating version based on means:
+CDES48line.pri.mean <- data %>%
+  filter(D48excess.label=="no D48 excess")%>%
+  filter(Donotuse != TRUE & Type=="heated gas" | Type=="equilibrated gas") %>%
+  left_join(select(Standards, Sample.ID, D48.CDES.90.acc), by = "Sample.ID") %>%
+  group_by(Sample.ID) %>%
+  summarize(D48.accepted = mean(D48.CDES.90.acc),
+            D48.measured = mean(D48.HGcorr))
+
+CDES.48slope.pri.mean <- (coef(lm(CDES48line.pri.mean$D48.accepted ~ CDES48line.pri.mean$D48.measured))[[2]])
+CDES.48intercept.pri.mean <- (coef(lm(CDES48line.pri.mean$D48.accepted ~ CDES48line.pri.mean$D48.measured))[[1]])
+
+data$CDES.48noAD.pri <- CDES.48slope.pri.mean*data$D48.HGcorr+CDES.48intercept.pri.mean #calculates pre-Acid digestion corrected CDES values
+data$CDES.48noAD.pri.all <- CDES.48slope.pri*data$D48.HGcorr+CDES.48intercept.pri #calculates pre-Acid digestion corrected CDES values
+```
+
+Plots CDES D48 transfer function line from just the reference gas data - the regression in this plot is based only on the heated and equilibrated gas data. The larger standard symbols show the internal heated gas corrected values versus the ARF values they have using the results of this regression, and the smaller sample values show the internal Acid digestion corrected values versus the ARF acid digestion corrected values.
+
+CHECK: if there are no problems with the acid digestion step, AD-corrected values should fall on the line; IS THIS REALLY TRUE?
+
+*Note that in this plot, the line is regressed based on ONLY the gas data. The big standards are the pre-acid digestion corrected values, and the small standards are the acid digestion corrected values....
+```{r plot-CDES48line.pri, fig.width=8}
+
+pCDES48line.pri <- ggplot(CDES48line.pri, aes(x=D48.HGcorr, y=D48.CDES.90.acc)) +
+  geom_point(aes(fill=Sample.ID , shape=Sample.ID), size=4) +  
+  stat_smooth(method="lm") +
+  geom_abline(slope = CDES.48slope.pri.mean, intercept = CDES.48intercept.pri.mean, colour = "red") +
+  geom_point(data=subset(data, Type=="standard" & D48excess.label=="no D48 excess"), aes(x=D48.HGcorr, y=CDES.48noAD.pri, fill=Sample.ID, shape=Sample.ID, show_guide=FALSE), size=3) + 
+  scale_shape_manual(values=c(21,22,23,24,25,21,22,23,24)) +
+  labs(title=paste0(session, " Primary CDES transfer function"), x="Internal D48", y="CDES D48") +
+  theme_bw()
+
+pCDES48line.pri
+```    
+
+### 3. Make heated gas D47 line from data with no D48 excess and no analytical problems
+
+Perform initial regression
+```{r D47line}
+HG47data <- data %>% 
+  filter(Donotuse != TRUE & Type=="heated gas" & D48excess.label != "D48.excess") %>%
+  select(Sample.ID, Type, num.acq, spec.num, d47, D47, D47.sterr, d47.sterr)
+
+D47line.initial <- cbind(data.frame(Session=session, MS=MS.ID, line.ID="initial D47line"), york.regression(HG47data$d47, HG47data$d47.sterr, HG47data$D47, HG47data$D47.sterr))
+
+HG47data<-calc_exterr(HG47data, 47, D47line.initial$york.slope, D47line.initial$york.intercept, D47line.initial$N)
+
+D47line.final <- cbind(data.frame(Session=session, MS=MS.ID, line.ID="final D47line"), york.regression(HG47data$d47, HG47data$d47exterr, HG47data$D47, HG47data$D47exterr))
+
+D47lines<-rbind(D47line.initial, D47line.final)
+print(D47lines)
+```
+
+Plot heated gas 47 line with confidence and predictive intervals, including samples w 48 excess
+```{r plotHG47bytype, fig.width=8}
+D47data <- data %>% 
+  select(Sample.ID, num.acq, spec.num, Type, Donotuse, D48excess.label, d47, D47, D47.sterr, d47.sterr)
+
+D47data<-york.conf.pred.interval(HG47data, D47data, 47, D47line.final$york.slope, D47line.final$york.intercept, 0.95)
+
+D47line<- D47data %>%
+  filter(Donotuse != TRUE) %>%
+  ggplot(aes(x=d47, y=D47)) +
+  geom_ribbon(aes(ymin=all.predicted.Y-D47.pred.int, ymax=all.predicted.Y+D47.pred.int), fill="gray") +
+  geom_ribbon(aes(ymin=all.predicted.Y-D47.conf.int, ymax=all.predicted.Y+D47.conf.int), fill="white") +
+  geom_abline(data=D47line.final, aes(slope=york.slope, intercept=york.intercept), size=0.5) +
+  geom_point(aes(fill=Sample.ID, shape=D48excess.label), size=3) +
+  guides(fill=FALSE) +
+  scale_shape_manual(values=c(21,22,24,25,23)) +
+  annotate("text", x = -5, y = 0.4, label = york_eqn(D47line.final$york.slope, D47line.final$york.intercept),  size = 4, hjust=0, vjust=0, parse=TRUE) +
+  theme_bw() + 
+  labs(title=paste0(session, " D47 line"))
+
+ggplotly(D47line)
+```
+
+### 4. Calculate HG line external D47 errors (includes error from heated gas line)  
+Calculating final D47 external variance and standard error based on heated gas line
+```{r calc-finalerrors}
+data <- calc_prop_errors_lines(data, data$d47, data$d47.sterr, data$D47.sterr, D47line.final$york.slope, D47line.final$york.slope.err, D47line.final$york.int.err, D47line.final$Cor.ab)
+data <- rename(data, D47.HG.prop.err = Y.prop.err) #output from function is meant to be generic: "Y.prop.err" so this renames the output column to be specific
+```
+
+### 5. Initial data corrections: HG line, stretching, internal acid digestion correction
+heated gas, stretching and acid digestion corrections to use for internal Caltech corrections and the gas approach to ARF conversion
+```{r HG47corrections}
+data$HGcorr <- data$D47 - (data$d47 * D47line.final$york.slope + D47line.final$york.intercept) # HG line correction; this column should be used for conversion to CDES reference frame if using gases to convert
+
+```
+
+### 6. Absolute Reference Frame (CDES)
+#### 6.1. Make ETF lines from data with no D48 excess and calculate CDES D47 values
+##### 6.1.1 Primary Approach - uses heated and equilibrated gases    
+    
+```{r calc-CDESfunctions.pri}
+CDESline.pri <- data %>%
+  filter(D48excess.label=="no D48 excess" & Donotuse != TRUE & Type=="heated gas" | Type=="equilibrated gas") %>%
+  left_join(select(Standards, Sample.ID, D47.CDES.90.acc), by = "Sample.ID")
+
+CDES.slope.pri <- (coef(lm(CDESline.pri$D47.CDES.90.acc ~ CDESline.pri$HGcorr))[[2]])
+CDES.intercept.pri <- (coef(lm(CDESline.pri$D47.CDES.90.acc ~ CDESline.pri$HGcorr))[[1]])
+
+data$CDES.noAD.pri <- CDES.slope.pri*data$HGcorr+CDES.intercept.pri #calculates pre-Acid digestion corrected CDES values
+
+#Adds acid digestion factor to CDES values - multiple options: 0.092 is from Henkes et al., 2013. 0.082 is from Defliese et al., 2015.
+data$CDES.ADH.pri <- data$CDES.noAD.pri + 0.092 
+data$CDES.ADD.pri <- data$CDES.noAD.pri + 0.082 
+
+```
+
+Plots ARF transfer function line from just the heated gas data - the regression in this plot is based only on the heated and equilibrated gas data. The larger standard symbols show the internal heated gas corrected values versus the ARF values they have using the results of this regression, and the smaller sample values show the internal Acid digestion corrected values versus the ARF acid digestion corrected values.
+
+CHECK: if there are no problems with the acid digestion step, AD-corrected values should fall on the line; IS THIS REALLY TRUE?
+
+*Note that in this plot, the line is regressed based on ONLY the gas data. The big standards are the pre-acid digestion corrected values, and the small standards are the acid digestion corrected values....
+```{r plot-CDESline.pri, fig.width=8}
+
+pCDESline.pri <- ggplot(CDESline.pri, aes(x=HGcorr, y=D47.CDES.90.acc)) +
+  geom_point(aes(fill=Sample.ID , shape=Sample.ID), size=4) +  
+  stat_smooth(method="lm") +
+  geom_point(data=subset(data, Type=="standard" & D48excess.label=="no D48 excess"), aes(x=HGcorr, y=CDES.noAD.pri, fill=Sample.ID, shape=Sample.ID, show_guide=FALSE), size=3) + 
+  scale_shape_manual(values=c(21,22,23,24,25,21,22,23,24)) +
+  labs(title=paste0(session, " Primary CDES transfer function"), x="Internal D47", y="CDES D47") +
+  theme_bw()
+
+pCDESline.pri
+```    
+
+#### 6.2.1 Calculate standard residuals from ARF D47 values
+Determines standard residuals for all standards, and determines average residuals from standards with no D48 excess; currently using the DeFleise AFF
+```{r calc-CDES.std.residuals.pri}
+
+CDES.std.pri <- data %>%
+  filter(D48excess.label=="no D48 excess" & Donotuse != TRUE & Type=="standard") # make a subset of HG and EG with no analytical problems and no D48 excess
+
+CDES.std.pri <-  left_join(CDES.std.pri, select(Standards, Sample.ID, D47.CDES.90.acc, D47.CDES.25H.acc, D47.CDES.25D.acc), by = "Sample.ID")
+
+CDES.stdres.pri<- CDES.std.pri %>%
+  group_by(Sample.ID) %>%
+  summarise(Residual = "CDES primary",
+            Residual.mean.90 = round(mean(CDES.noAD.pri), 4)-D47.CDES.90.acc[1],
+            Residual.mean.D = round(mean(CDES.ADD.pri), 4)-D47.CDES.25D.acc[1],
+            Residual.mean.H = round(mean(CDES.ADH.pri), 4)-D47.CDES.25H.acc[1],
+            Residual.stdev = round(sd(CDES.noAD.pri), 4),
+            Residual.sterr = round(sd(CDES.noAD.pri)/sqrt(length(Sample.ID)), 4),
+            N = length(Sample.ID)
+  )
+
+CDES.stdres.pri
+
+```
+
+Plots of average and 1sigma standard deviation of the standard residuals for standards without D48 excess, with individual values shown,and with and without boxplots superimposed
+```{r plot-CDEF.stdres.pri, fig.width=16}
+
+#with boxplots, no acid digestion correction
+CDES.residuals.pri.90<-ggplot(CDES.stdres.pri, aes(x=Sample.ID, y=Residual.mean.90, shape=Sample.ID, fill=Sample.ID)) +
+  geom_hline(yintercept=0, linetype=2) +
+  geom_errorbar(aes(ymin=(Residual.mean.90-2*Residual.sterr), ymax=(Residual.mean.90+2*Residual.sterr), colour=Sample.ID), width=.3) +
+  geom_boxplot(data=CDES.std.pri, aes(x=Sample.ID, y=CDES.noAD.pri-D47.CDES.90.acc, fill=Sample.ID, shape=NULL)) +
+  geom_point(data=CDES.std.pri, aes(x=Sample.ID, y=CDES.noAD.pri-D47.CDES.90.acc, fill=Sample.ID, shape=Sample.ID), size=2) +
+  geom_point(data=CDES.stdres.pri, aes(x=Sample.ID, y=Residual.mean.90, fill=Sample.ID, shape=Sample.ID), size=6) +
+  scale_shape_manual(values=c(21,22,23,24,25)) +
+  labs(title=paste0(session, " avg. and 2se, boxplot of residuals, CDES primary"), x="Standard ID", y="Mean standard residual") +
+  theme_bw() +
+  theme(legend.title=element_blank())
+
+ggplotly(CDES.residuals.pri.90)
+```
+
+#### 6.3.1 Standard corrections for CDES D47 values from data with no D48 excess  
+
+##### 6.3.1.a Standard correct using a line between the standards
+```{r CDES.stdcorr.line.pri, fig.width=8}
+#plot line between standards for correcting data for no acid digestion values, Henkes AFF values and Defliese AFF values
+
+CDES.stds.pri <- CDES.std.pri %>%
+  gather(CDES_type, CDES_values, CDES.noAD.pri, CDES.ADH.pri, CDES.ADD.pri) %>%
+  gather(CDES_acc_type, CDES_acc_values, D47.CDES.90.acc, D47.CDES.25H.acc, D47.CDES.25D.acc) %>%
+  filter(CDES_type == "CDES.noAD.pri" & CDES_acc_type == "D47.CDES.90.acc" | CDES_type == "CDES.ADH.pri" & CDES_acc_type == "D47.CDES.25H.acc" | CDES_type == "CDES.ADD.pri" & CDES_acc_type == "D47.CDES.25D.acc")
+
+CDES.std.line.pri<-ggplot(CDES.stds.pri) +
+  geom_abline(slope=1, intercept=0, linetype=2) +
+  stat_smooth(method = "lm", aes(x=CDES_values, y=CDES_acc_values, colour = CDES_type)) +
+  geom_point(aes(x=CDES_values, y=CDES_acc_values, fill = CDES_type, shape = Sample.ID), size=4) +
+  labs(title=paste0(session, " line for CDES.std correction, primary CDES")) +
+  scale_shape_manual(values = c(21,22,23,24,25)) +
+  theme_bw()
+
+#standard correct the Henkes AFF values
+CDES.std.line.slope.pri.H<-(coef(lm(CDES.std.pri$D47.CDES.25H.acc ~ CDES.std.pri$CDES.ADH.pri))[[2]]) #calculates slope of measured v accepted line btw standards
+CDES.std.line.intercept.pri.H<-(coef(lm(CDES.std.pri$D47.CDES.25H.acc ~ CDES.std.pri$CDES.ADH.pri))[[1]]) #calcs intercept of measured v accepted standard line
+CDES.std.line.offset.pri.H<-data$CDES.ADH.pri - (CDES.std.line.slope.pri.H * data$CDES.ADH.pri + CDES.std.line.intercept.pri.H) #calculates offset values for all acid corrected values
+
+data$CDES.D47stdcorrH.pri<-data$CDES.ADH.pri - CDES.std.line.offset.pri.H #calculates D47 values using the standard line correction
+
+#standard correct the Defliese AFF values
+CDES.std.line.slope.pri.D<-(coef(lm(CDES.std.pri$D47.CDES.25D.acc ~ CDES.std.pri$CDES.ADD.pri))[[2]]) #calculates slope of measured v accepted line btw standards
+CDES.std.line.intercept.pri.D<-(coef(lm(CDES.std.pri$D47.CDES.25D.acc ~ CDES.std.pri$CDES.ADD.pri))[[1]]) #calcs intercept of measured v accepted standard line
+CDES.std.line.offset.pri.D<-data$CDES.ADD.pri - (CDES.std.line.slope.pri.D * data$CDES.ADD.pri + CDES.std.line.intercept.pri.D) #calculates offset values for all acid corrected values
+
+data$CDES.D47stdcorrD.pri<-data$CDES.ADD.pri - CDES.std.line.offset.pri.D #calculates D47 values using the standard line correction
+
+#standard correct the no-acid-correction values (for Bonifacie calibration)
+CDES.std.line.slope.pri.noAD<-(coef(lm(CDES.std.pri$D47.CDES.90.acc ~ CDES.std.pri$CDES.noAD.pri))[[2]]) #calculates slope of measured v accepted line btw standards
+CDES.std.line.intercept.pri.noAD<-(coef(lm(CDES.std.pri$D47.CDES.90.acc ~ CDES.std.pri$CDES.noAD.pri))[[1]]) #calcs intercept of measured v accepted standard line
+CDES.std.line.offset.pri.noAD<-data$CDES.noAD.pri - (CDES.std.line.slope.pri.noAD * data$CDES.noAD.pri + CDES.std.line.intercept.pri.noAD) #calculates offset values for all acid corrected values
+
+data$CDES.D47stdcorr90.pri <-data$CDES.noAD.pri - CDES.std.line.offset.pri.noAD #calculates D47 values using the standard line correction
+
+CDES.std.line.pri
+```
+
+#### 6.4.1 Calculate temperatures
+```{r calc-CDES.Ghosh.T.pri}
+data$CDES.ghosh.temp.pri.H <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.ADH.pri) #calculate temps from Acid corrected D47 values (Henkes AFF)
+data$CDES.ghosh.temp.stdcorr.pri.H <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.D47stdcorrH.pri) #calculate temps from Acid corrected (Henkes AFF) and carbonate standard corrected D47 values
+
+data$CDES.ghosh.temp.pri.D <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.ADD.pri) #calculate temps from Acid corrected D47 values (Defliese AFF)
+data$CDES.ghosh.temp.stdcorr.pri.D <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.D47stdcorrD.pri) #calculate temps from Acid corrected (Defliese AFF) and carbonate standard corrected D47 values
+
+data$CDES.Bonifacie.temp.pri <- convert_ARF.D47_to_ARF.Bonifacie.temp(data$CDES.noAD.pri) #calculate temps from Acid corrected D47 values (no AFF)
+data$CDES.Bonifacie.temp.stdcorr.pri <- convert_ARF.D47_to_ARF.Bonifacie.temp(data$CDES.D47stdcorr90.pri) #calculate temps from no Acid corrected values and carbonate standard corrected D47 values
+```
+
+
+#### 6.1. Make ETF lines from data with no D48 excess and calculate ARF D47 values
+##### 6.1.2 Secondary Approach -uses standards to make ETF
+    
+```{r calc-CDESfunctions.sec.Henkes}
+
+CDESline.sec <- data %>%
+  filter(D48excess.label=="no D48 excess" & Donotuse != TRUE & Type=="standard") %>%
+  left_join(select(Standards, Sample.ID, D47.CDES.90.acc), by = "Sample.ID")
+
+CDES.slope.sec <- (coef(lm(CDESline.sec$D47.CDES.90.acc ~ CDESline.sec$HGcorr))[[2]])
+CDES.intercept.sec <- (coef(lm(CDESline.sec$D47.CDES.90.acc ~ CDESline.sec$HGcorr))[[1]])
+
+data$CDES.noAD.sec <- CDES.slope.sec*data$HGcorr+CDES.intercept.sec #calculates pre-Acid digestion corrected CDES values
+
+data$CDES.ADH.sec <- data$CDES.noAD.sec + 0.092 #Adds acid digestion factor to CDES values - multiple options: 0.092 is from Henkes et al., 2013. 0.082 is from Defliese et al., 2015.
+
+data$CDES.ADD.sec <- data$CDES.noAD.sec + 0.082 #Adds acid digestion factor to CDES values - multiple options: 0.092 is from Henkes et al., 2013. 0.082 is from Defliese et al., 2015.
+
+```
+
+Plots ARF transfer function line from just the heated gas data - the regression in this plot is based only on the heated and equilibrated gas data. The larger standard symbols show the internal heated gas corrected values versus the ARF values they have using the results of this regression, and the smaller sample values show the internal Acid digestion corrected values versus the ARF acid digestion corrected values.
+
+CHECK: if there are no problems with the acid digestion step, AD-corrected values should fall on the line; IS THIS REALLY TRUE?
+
+*Note that in this plot, the line is regressed based on ONLY the gas data. The big standards are the pre-acid digestion corrected values, and the small standards are the acid digestion corrected values....
+```{r plot-CDESline.sec, fig.width=8}
+
+pCDESlineH.sec <- ggplot(CDESline.sec, aes(x=HGcorr, y=D47.CDES.90.acc)) +
+  geom_point(aes(fill=Sample.ID , shape=Sample.ID), size=4) +  
+  stat_smooth(method="lm") +
+  geom_point(data=subset(data, Type=="standard" & D48excess.label=="no D48 excess"), aes(x=HGcorr, y=CDES.noAD.sec, fill=Sample.ID, shape=Sample.ID, show_guide=FALSE), size=3) + 
+  scale_shape_manual(values=c(21,22,23,24,25,21,22,23,24)) +
+  labs(title=paste0(session, " Secondary CDES transfer function, using Henkes AFF"), x="Internal D47", y="CDES D47") +
+  theme_bw()
+
+pCDESlineD.sec <- ggplot(CDESline.sec, aes(x=HGcorr, y=D47.CDES.90.acc)) +
+  geom_point(aes(fill=Sample.ID , shape=Sample.ID), size=4) +  
+  stat_smooth(method="lm") +
+  geom_point(data=subset(data, Type=="standard" & D48excess.label=="no D48 excess"), aes(x=HGcorr, y=CDES.noAD.sec, fill=Sample.ID, shape=Sample.ID, show_guide=FALSE), size=3) + 
+  scale_shape_manual(values=c(21,22,23,24,25,21,22,23,24)) +
+  labs(title=paste0(session, " Secondary CDES transfer function, using Defliese AFF"), x="Internal D47", y="ARF D47") +
+  theme_bw()
+
+subplot(pCDESlineH.sec, pCDESlineD.sec, nrows = 2)
+```    
+
+#### 6.2.2 Calculate standard residuals from ARF D47 values
+Determines standard residuals for all standards, and determines average residuals from standards with no D48 excess; currently using the DeFleise AFF
+```{r calc-CDES.std.residuals.sec}
+
+CDES.std.sec <- data %>%
+  filter(D48excess.label=="no D48 excess" & Donotuse != TRUE & Type=="standard") # make a subset of HG and EG with no analytical problems and no D48 excess
+
+CDES.std.sec <-  left_join(CDES.std.sec, select(Standards, Sample.ID, D47.CDES.90.acc, D47.CDES.25H.acc, D47.CDES.25D.acc), by = "Sample.ID")
+
+CDES.stdres.sec<- CDES.std.sec %>%
+  group_by(Sample.ID) %>%
+  summarise(Residual = "CDES secondary",
+            Residual.mean.90 = round(mean(CDES.noAD.sec), 4)-D47.CDES.90.acc[1],
+            Residual.mean.D=round(mean(CDES.ADD.sec), 4)-D47.CDES.25D.acc[1],
+            Residual.mean.H=round(mean(CDES.ADH.sec), 4)-D47.CDES.25H.acc[1],
+            Residual.stdev=round(sd(CDES.ADH.sec), 4),
+            Residual.sterr=round(sd(CDES.ADH.sec)/sqrt(length(Sample.ID)), 4),
+            N= length(Sample.ID)
+  )
+
+CDES.stdres.sec
+
+```
+
+Plots of average and 1sigma standard deviation of the standard residuals for standards without D48 excess, with individual values shown,and with and without boxplots superimposed
+```{r plot-CDEF.stdres.sec, fig.width=16}
+
+#with boxplots, no acid digestion correction
+CDES.residuals.sec.bp.90<-ggplot(CDES.stdres.sec, aes(x=Sample.ID, y=Residual.mean.90, shape=Sample.ID, fill=Sample.ID)) +
+  geom_hline(yintercept=0, linetype=2) +
+  geom_errorbar(aes(ymin=(Residual.mean.90-2*Residual.sterr), ymax=(Residual.mean.90+2*Residual.sterr), colour=Sample.ID), width=.3) +
+  geom_boxplot(data=CDES.std.sec, aes(x=Sample.ID, y=CDES.noAD.sec-D47.CDES.90.acc, fill=Sample.ID, shape=NULL)) +
+  geom_point(data=CDES.std.sec, aes(x=Sample.ID, y=CDES.noAD.sec-D47.CDES.90.acc, fill=Sample.ID, shape=Sample.ID), size=2) +
+  geom_point(data=CDES.stdres.sec, aes(x=Sample.ID, y=Residual.mean.90, fill=Sample.ID, shape=Sample.ID), size=6) +
+  scale_shape_manual(values=c(21,22,23,24,25)) +
+  labs(title=paste0(session, " avg. and 2se, boxplot of residuals, CDES secondary"), x="Standard ID", y="Mean standard residual") +
+  theme_bw() +
+  theme(legend.title=element_blank())
+
+ggplotly(CDES.residuals.sec.bp.90)
+```
+
+#### 6.3.2 Standard corrections for CDES D47 values from data with no D48 excess  
+
+##### 6.3.2.a Standard correct using a line between the standards
+```{r CDES.stdcorr.line.sec, fig.width=8}
+#plot line between standards for correcting data for no acid digestion values, Henkes AFF values and Defliese AFF values
+
+CDES.stds.sec <- CDES.std.sec %>%
+  gather(CDES_type, CDES_values, CDES.noAD.sec, CDES.ADH.sec, CDES.ADD.sec) %>%
+  gather(CDES_acc_type, CDES_acc_values, D47.CDES.90.acc, D47.CDES.25H.acc, D47.CDES.25D.acc) %>%
+  filter(CDES_type == "CDES.noAD.sec" & CDES_acc_type == "D47.CDES.90.acc" | CDES_type == "CDES.ADH.sec" & CDES_acc_type == "D47.CDES.25H.acc" | CDES_type == "CDES.ADD.sec" & CDES_acc_type == "D47.CDES.25D.acc")
+
+CDES.std.line.sec<-ggplot(CDES.stds.sec) +
+  geom_abline(slope=1, intercept=0, linetype=2) +
+  stat_smooth(method = "lm", aes(x=CDES_values, y=CDES_acc_values, colour = CDES_type)) +
+  geom_point(aes(x=CDES_values, y=CDES_acc_values, fill = CDES_type, shape = Sample.ID), size=4) +
+  labs(title=paste0(session, " line for CDES.std correction, secondary CDES")) +
+  scale_shape_manual(values = c(21,22,23,24,25)) +
+  theme_bw()
+
+#standard correct the Henkes AFF values
+CDES.std.line.slope.sec.H<-(coef(lm(CDES.std.sec$D47.CDES.25H.acc ~ CDES.std.sec$CDES.ADH.sec))[[2]]) #calculates slope of measured v accepted line btw standards
+CDES.std.line.intercept.sec.H<-(coef(lm(CDES.std.sec$D47.CDES.25H.acc ~ CDES.std.sec$CDES.ADH.sec))[[1]]) #calcs intercept of measured v accepted standard line
+CDES.std.line.offset.sec.H<-data$CDES.ADH.sec - (CDES.std.line.slope.sec.H * data$CDES.ADH.sec + CDES.std.line.intercept.sec.H) #calculates offset values for all acid corrected values
+
+data$CDES.D47stdcorrH.sec<-data$CDES.ADH.sec - CDES.std.line.offset.sec.H #calculates D47 values using the standard line correction
+
+#standard correct the Defliese AFF values
+CDES.std.line.slope.sec.D<-(coef(lm(CDES.std.sec$D47.CDES.25D.acc ~ CDES.std.sec$CDES.ADD.sec))[[2]]) #calculates slope of measured v accepted line btw standards
+CDES.std.line.intercept.sec.D<-(coef(lm(CDES.std.sec$D47.CDES.25D.acc ~ CDES.std.sec$CDES.ADD.sec))[[1]]) #calcs intercept of measured v accepted standard line
+CDES.std.line.offset.sec.D<-data$CDES.ADD.sec - (CDES.std.line.slope.sec.D * data$CDES.ADD.sec + CDES.std.line.intercept.sec.D) #calculates offset values for all acid corrected values
+
+data$CDES.D47stdcorrD.sec<-data$CDES.ADD.sec - CDES.std.line.offset.sec.D #calculates D47 values using the standard line correction
+
+#standard correct the no-acid-correction values (for Bonifacie calibration)
+CDES.std.line.slope.sec.noAD<-(coef(lm(CDES.std.sec$D47.CDES.90.acc ~ CDES.std.sec$CDES.noAD.sec))[[2]]) #calculates slope of measured v accepted line btw standards
+CDES.std.line.intercept.sec.noAD<-(coef(lm(CDES.std.sec$D47.CDES.90.acc ~ CDES.std.sec$CDES.noAD.sec))[[1]]) #calcs intercept of measured v accepted standard line
+CDES.std.line.offset.sec.noAD<-data$CDES.noAD.sec - (CDES.std.line.slope.sec.noAD * data$CDES.noAD.sec + CDES.std.line.intercept.sec.noAD) #calculates offset values for all acid corrected values
+
+data$CDES.D47stdcorr90.sec<-data$CDES.noAD.sec - CDES.std.line.offset.sec.noAD #calculates D47 values using the standard line correction
+
+CDES.std.line.sec
+```
+
+#### 6.4.2 Calculate temperatures
+```{r calc-CDES.Ghosh.T}
+data$CDES.ghosh.temp.sec.H <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.ADH.sec) #calculate temps from Acid corrected D47 values (Henkes AFF)
+data$CDES.ghosh.temp.stdcorr.sec.H <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.D47stdcorrH.sec) #calculate temps from Acid corrected (Henkes AFF) and carbonate standard corrected D47 values
+
+data$CDES.ghosh.temp.sec.D <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.ADD.sec) #calculate temps from Acid corrected D47 values (Defliese AFF)
+data$CDES.ghosh.temp.stdcorr.sec.D <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.D47stdcorrD.sec) #calculate temps from Acid corrected (Defliese AFF) and carbonate standard corrected D47 values
+
+data$CDES.Bonifacie.temp.sec <- convert_ARF.D47_to_ARF.Bonifacie.temp(data$CDES.noAD.sec) #calculate temps from Acid corrected D47 values (no AFF)
+data$CDES.Bonifacie.temp.stdcorr.sec <- convert_ARF.D47_to_ARF.Bonifacie.temp(data$CDES.D47stdcorr90.sec) #calculate temps from no Acid corrected values and carbonate standard corrected D47 values
+
+```
+    
+### Data processing synthesis and comparisons
+#### Synthesis tables
+
+D48 line parameters for 1st and 2nd methods; will overwrite previous versions of the sample session data if an earlier round was already appended
+```{r table-D48lines}
+York.lines<-rbind(D48lines, D47lines)
+print(York.lines)
+
+write.csv(York.lines, file=paste0(session, "_Yorklineparameters.csv"))
+```
+
+#### Comparison of primary and secondary
+```{r plot-CDEScomparison, fig.width=8}
+CDESlines<-ggplot(CDESline.pri, aes(x=HGcorr, y=D47.CDES.90.acc)) +
+  geom_point(aes(fill=Sample.ID, shape=Sample.ID), size=4) +
+  stat_smooth(method="lm") +
+  geom_point(data=CDESline.sec, aes(x=HGcorr, y=D47.CDES.90.acc, fill=Sample.ID, shape=Sample.ID), size=4) +
+  stat_smooth(data=CDESline.sec,  aes(x=HGcorr, y=D47.CDES.90.acc), method="lm", linetype=2, colour="red") +
+  scale_shape_manual(values=c(21,22,23,24,25,21,22,23,24)) +
+  annotate("text", x = 0.1, y = 0.76, label = lm_eqn(CDESline.pri$HGcorr, CDESline.pri$D47.CDES.90.acc),  size = 4, hjust=0, vjust=0, parse=TRUE, colour="blue") +
+  annotate("text", x = 0.1, y = 0.70, label = lm_eqn(CDESline.sec$HGcorr, CDESline.sec$D47.CDES.90.acc),  size = 4, hjust=0, vjust=0, parse=TRUE, colour="red") +
+  labs(title=paste0(session, " CDES method comparison, primary and secondary methods"), x="Internal D47", y="ARF D47") +
+  theme_bw()
+
+CDESlines
+```
+
+#### Comparison of standard residuals
+```{r plot-compare.residuals, fig.width=14, fig.height=14}
+residual.comparison <- multiplot(CDES.residuals.pri.90, CDES.residuals.sec.bp.90, CDES.residuals.pri.D, CDES.residuals.sec.bp.D, CDES.residuals.pri.H, CDES.residuals.sec.bp.H, cols=3)
+
+Std.res.all <- bind_rows(CDES.stdres.pri, CDES.stdres.sec)
+  
+write.csv(Std.res.all, file=paste0(session, "_CITstdresiduals.csv"))
+
+residual.comparison
+```
+
+average reference data (standards, equilibrated gases), and plot D47,90 vs D48, 90 and compare to theoretical dual equilibrium line of Fiebig et al., 2019 (derived from Hill et al., 2014 Keq calculations for D63 and D64 of calcite)
+```{r calc-avgs-plot47v48}
+
+data.avg <- data %>%
+  group_by(Sample.ID) %>%
+  filter(D48excess.label == "no D48 excess" & Project == "all") %>%
+  summarise(N = n(),
+            d13C.se = sd(d13C)/sqrt(N),
+            d13C.avg = mean(d13C),
+            d18O.se = sd(d18O.VPDB.min)/sqrt(N),
+            d18O.avg = mean(d18O.VPDB.min),
+            D47.se = sd(CDES.D47stdcorr90.pri)/sqrt(N),
+            D47.2se = 2*D47.se,
+            D47.90.noAD.avg = mean(CDES.noAD.pri),
+            D47.90.avg = mean(CDES.D47stdcorr90.pri),
+            D47.25D.avg = mean(CDES.D47stdcorrD.pri),
+            D48.se = sd(CDES.48noAD.pri)/sqrt(N),
+            D48.2se = 2*D48.se,
+            D48.90.avg = mean(CDES.48noAD.pri),
+            D48.se.all = sd(CDES.48noAD.pri.all)/sqrt(N),
+            D48.2se.all = 2*D48.se.all,
+            D48.90.avg.all = mean(CDES.48noAD.pri.all),
+            T.B = convert_ARF.D47_to_ARF.Ghosh.temp(D47.90.avg),
+            T.B.se = calc_D47.Temp_se(T.B, D47.90.avg, D47.se),
+            T.G = convert_ARF.D47_to_ARF.Ghosh.temp(D47.25D.avg),
+            T.G.se = calc_D47.Temp_se(T.B, D47.25D.avg, D47.se),
+            d18Ow.B = calc_d18Ow(d18O.avg, T.B),
+            d18Ow.B.se = calc_d18Owse(d18O.avg, d18O.se, T.B, T.B.se),
+            d18Ow.G = calc_d18Ow(d18O.avg, T.G),
+            d18Ow.G.se = calc_d18Owse(d18O.avg, d18O.se, T.G, T.G.se))
+
+pD47vD48 <- ggplot(data = data.frame(x=c(0.1, 0.7)), aes(x)) +
+  stat_function(fun = function(x) {0.1829*(x^2) + 0.2138*(x) - 0.0139}, colour = "light gray") +
+  stat_function(fun = function(x) {0.3821*(x^2) + 0.0044*(x) + 0.1198}) + 
+  geom_errorbar(data = data.avg, aes(x=D47.90.noAD.avg, ymin=D48.90.avg - D48.2se, ymax=D48.90.avg + D48.2se, colour = Sample.ID)) +
+  geom_errorbarh(data = data.avg, aes(x=D47.90.noAD.avg, y=D48.90.avg, xmin=D47.90.noAD.avg - D47.2se, xmax = D47.90.noAD.avg + D47.2se , colour = Sample.ID)) +
+  geom_point(data = data.avg, aes(x=D47.90.noAD.avg, y=D48.90.avg, fill = Sample.ID, colour = NULL), size = 3, shape = 21) +
+  #scale_shape_manual(values = c(21,22,23,24,25)) +
+  theme_bw()
+
+pD47vD48.all <- ggplot(data = data.frame(x=c(0.1, 0.7)), aes(x)) +
+  stat_function(fun = function(x) {0.1829*(x^2) + 0.2138*(x) - 0.0139}, colour = "light gray") +
+  stat_function(fun = function(x) {0.3821*(x^2) + 0.0044*(x) + 0.1198}) + 
+  geom_errorbar(data = data.avg, aes(x=D47.90.noAD.avg, ymin=D48.90.avg.all - D48.2se.all, ymax=D48.90.avg.all + D48.2se.all, colour = Sample.ID)) +
+  geom_errorbarh(data = data.avg, aes(x=D47.90.noAD.avg, y=D48.90.avg.all, xmin=D47.90.noAD.avg - D47.2se, xmax = D47.90.noAD.avg + D47.2se , colour = Sample.ID)) +
+  geom_point(data = data.avg, aes(x=D47.90.noAD.avg, y=D48.90.avg.all, fill = Sample.ID, colour = NULL), size = 3, shape = 21) +
+  #scale_shape_manual(values = c(21,22,23,24,25)) +
+  theme_bw()
+
+pD47vD48
+pD47vD48.all
+data.avg
+```
+
+same plot of D47 v D48, but plotting all the individual values, instead of the averages
+```{r plot-all-47v48}
+
+pD47vD48.all <- ggplot(data = data.frame(x=c(0.1, 0.7)), aes(x)) +
+  stat_function(fun = function(x) {0.1829*(x^2) + 0.2138*(x) - 0.0139}, colour = "light gray") + #D48 of C02, from Fiebig eq. for Wang et al., 2004
+  stat_function(fun = function(x) {0.3821*(x^2) + 0.0044*(x) + 0.1198}) + #from data in Hill et al 2014; regression from values in Table B2
+  geom_point(data = data, aes(x=CDES.noAD.pri, y=CDES.48noAD.pri, fill = Sample.ID, colour = NULL, shape = D48excess.label), size = 2) +
+  scale_shape_manual(values = c(21,23,24)) +
+  theme_bw()
+
+ggplotly(pD47vD48.all)
+
+```
+
+
+```{r data.output}
+write.csv(data, file=paste0(session, "_brandcorr_reprocessed.csv"))
+```
+
+
+Can subdivide the dataset into individual projects, each with all of the "all" data, to use for supplemental files for different projects. To use, you'll need to manually update the separate project dataframe names and filtering criteria, and then the worksheet labels accordingly
+```{r diff-projects}
+
+# unique(data$Project)
+# data.nozero <- data %>%
+#   filter(Sample.ID != "zero")
+# 
+# RS <- data.nozero %>%
+#   filter(Project == "all" | Project =="RS")
+# 
+# Thomas <- data.nozero %>%
+#   filter(Project == "all" | Project =="Thomas")
+# 
+# Layzell <- data.nozero %>%
+#   filter(Project == "all" | Project =="Layzell")
+# 
+# add_ws_with_data <- function(wb, sheet, data) {
+#   addWorksheet(wb, sheet)
+#   writeData(wb, sheet=sheet, data)
+#   return(wb)
+# }
+# 
+# wb <- createWorkbook("data") 
+# wb <- add_ws_with_data(wb, "all data", data)
+# wb <- add_ws_with_data(wb, "RS", RS)
+# wb <- add_ws_with_data(wb, "Thomas", Thomas)
+# wb <- add_ws_with_data(wb, "Layzell", Thomas)
+# saveWorkbook(wb, paste0(session, "_flatlist_project.xlsx"), overwrite = TRUE)
