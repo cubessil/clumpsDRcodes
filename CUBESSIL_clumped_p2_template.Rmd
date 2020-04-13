@@ -54,7 +54,7 @@ library(tidyverse)
 library(CUBESSILclumpedmath)
 #library(clumpsDRtools)
 
-Standards <- readRDS(url("https://github.com/cubessil/clumpsDRcodes/blob/master/Standards_070319.RDS?raw=true"))
+Standards <- readRDS(url("https://github.com/cubessil/clumpsDRcodes/blob/master/Standards.RDS?raw=true"))
 ```
 
 Fixing name mistakes, subset data to project, drop remaining unrelated samples
