@@ -36,7 +36,7 @@ library(tidyverse)
 library(isoprocessCUBES)
 library(CUBESSILclumpedmath)
 
-Standards <- readRDS(url("https://github.com/cubessil/clumpsDRcodes/blob/master/Standards_070319.RDS?raw=true"))
+Standards <- readRDS(url("https://github.com/cubessil/clumpsDRcodes/blob/master/Standards.RDS?raw=true"))
 #ProjectIDs <- read.csv("ProjectIDs.csv")  IMPLEMENT - lets start a data file of sample IDs and Project IDS, so we can leave this out of the functions, but have a good cross platform, can store as RDS and read it in from github as well....
 ```
 
