@@ -37,25 +37,29 @@ MANUALLY UPDATE: input your file namge and give the session a name
 User <- "XXXXX"
 session <-"XXXXXX"  #change this to whatever name or number you want to give you session
 MS.ID<-"Bert"   
-
 data <- read.csv("XXXXXXX.csv")
 data$MS <- MS.ID
 ```
 
 load necessary R libraries and clumped isotope standards data
 ```{r load-stuff}
-devtools::install_github("cubessil/CUBESSILclumpedmath") #general CUBESsil lab stuff
+#devtools::install_github("cubessil/CUBESSILclumpedmath") #general CUBESsil lab stuff
 #devtools::install_github("cubessil/clumpsDRtools") #only for processing clumped data
 
 library(plotly)
 library(shiny)
 library(isoprocessCUBES)
 library(tidyverse)
+library(openxlsx)
 library(CUBESSILclumpedmath)
 #library(clumpsDRtools)
 
 Standards <- readRDS(url("https://github.com/cubessil/clumpsDRcodes/blob/master/Standards.RDS?raw=true"))
 ```
+```{r}
+
+```
+
 
 Fixing name mistakes, subset data to project, drop remaining unrelated samples
 ```{r fix-mistakes}
@@ -289,10 +293,10 @@ CDES.intercept.pri <- (coef(lm(CDESline.pri$D47.CDES.90.acc ~ CDESline.pri$HGcor
 
 data$CDES.noAD.pri <- CDES.slope.pri*data$HGcorr+CDES.intercept.pri #calculates pre-Acid digestion corrected CDES values
 
-#Adds acid digestion factor to CDES values - multiple options: 0.092 is from Henkes et al., 2013. 0.082 is from Defliese et al., 2015.
+#Adds acid digestion factor to CDES values - multiple options: 0.092 is from Henkes et al., 2013. 0.082 is from Defliese et al., 2015, 0.088 is from Peterson et al., 2019
 data$CDES.ADH.pri <- data$CDES.noAD.pri + 0.092 
 data$CDES.ADD.pri <- data$CDES.noAD.pri + 0.082 
-
+data$CDES.ADP.pri <- data$CDES.noAD.pri + 0.088
 ```
 
 Plots ARF transfer function line from just the heated gas data - the regression in this plot is based only on the heated and equilibrated gas data. The larger standard symbols show the internal heated gas corrected values versus the ARF values they have using the results of this regression, and the smaller sample values show the internal Acid digestion corrected values versus the ARF acid digestion corrected values.
@@ -320,7 +324,7 @@ Determines standard residuals for all standards, and determines average residual
 CDES.std.pri <- data %>%
   filter(D48excess.label=="no D48 excess" & Donotuse != TRUE & Type=="standard") # make a subset of HG and EG with no analytical problems and no D48 excess
 
-CDES.std.pri <-  left_join(CDES.std.pri, select(Standards, Sample.ID, D47.CDES.90.acc, D47.CDES.25H.acc, D47.CDES.25D.acc), by = "Sample.ID")
+CDES.std.pri <-  left_join(CDES.std.pri, select(Standards, Sample.ID, D47.CDES.90.acc, D47.CDES.25H.acc, D47.CDES.25D.acc, D47.CDES.25P.acc), by = "Sample.ID")
 
 CDES.stdres.pri<- CDES.std.pri %>%
   group_by(Sample.ID) %>%
@@ -328,6 +332,7 @@ CDES.stdres.pri<- CDES.std.pri %>%
             Residual.mean.90 = round(mean(CDES.noAD.pri), 4)-D47.CDES.90.acc[1],
             Residual.mean.D = round(mean(CDES.ADD.pri), 4)-D47.CDES.25D.acc[1],
             Residual.mean.H = round(mean(CDES.ADH.pri), 4)-D47.CDES.25H.acc[1],
+            Residual.mean.P = round(mean(CDES.ADP.pri), 4)-D47.CDES.25P.acc[1],
             Residual.stdev = round(sd(CDES.noAD.pri), 4),
             Residual.sterr = round(sd(CDES.noAD.pri)/sqrt(length(Sample.ID)), 4),
             N = length(Sample.ID)
@@ -362,9 +367,9 @@ ggplotly(CDES.residuals.pri.90)
 #plot line between standards for correcting data for no acid digestion values, Henkes AFF values and Defliese AFF values
 
 CDES.stds.pri <- CDES.std.pri %>%
-  gather(CDES_type, CDES_values, CDES.noAD.pri, CDES.ADH.pri, CDES.ADD.pri) %>%
-  gather(CDES_acc_type, CDES_acc_values, D47.CDES.90.acc, D47.CDES.25H.acc, D47.CDES.25D.acc) %>%
-  filter(CDES_type == "CDES.noAD.pri" & CDES_acc_type == "D47.CDES.90.acc" | CDES_type == "CDES.ADH.pri" & CDES_acc_type == "D47.CDES.25H.acc" | CDES_type == "CDES.ADD.pri" & CDES_acc_type == "D47.CDES.25D.acc")
+  gather(CDES_type, CDES_values, CDES.noAD.pri, CDES.ADH.pri, CDES.ADD.pri, CDES.ADP.pri) %>%
+  gather(CDES_acc_type, CDES_acc_values, D47.CDES.90.acc, D47.CDES.25H.acc, D47.CDES.25D.acc, D47.CDES.25P.acc) %>%
+  filter(CDES_type == "CDES.noAD.pri" & CDES_acc_type == "D47.CDES.90.acc" | CDES_type == "CDES.ADH.pri" & CDES_acc_type == "D47.CDES.25H.acc" | CDES_type == "CDES.ADD.pri" & CDES_acc_type == "D47.CDES.25D.acc" | CDES_type == "CDES.ADP.pri" & CDES_acc_type == "D47.CDES.25P.acc")
 
 CDES.std.line.pri<-ggplot(CDES.stds.pri) +
   geom_abline(slope=1, intercept=0, linetype=2) +
@@ -388,6 +393,15 @@ CDES.std.line.offset.pri.D<-data$CDES.ADD.pri - (CDES.std.line.slope.pri.D * dat
 
 data$CDES.D47stdcorrD.pri<-data$CDES.ADD.pri - CDES.std.line.offset.pri.D #calculates D47 values using the standard line correction
 
+
+#standard correct the Peterson AFF values
+CDES.std.line.slope.pri.P<-(coef(lm(CDES.std.pri$D47.CDES.25P.acc ~ CDES.std.pri$CDES.ADP.pri))[[2]]) #calculates slope of measured v accepted line btw standards
+CDES.std.line.intercept.pri.P<-(coef(lm(CDES.std.pri$D47.CDES.25P.acc ~ CDES.std.pri$CDES.ADP.pri))[[1]]) #calcs intercept of measured v accepted standard line
+CDES.std.line.offset.pri.P<-data$CDES.ADP.pri - (CDES.std.line.slope.pri.P * data$CDES.ADP.pri + CDES.std.line.intercept.pri.P) #calculates offset values for all acid corrected values
+
+data$CDES.D47stdcorrP.pri<-data$CDES.ADP.pri - CDES.std.line.offset.pri.P #calculates D47 values using the standard line correction
+
+
 #standard correct the no-acid-correction values (for Bonifacie calibration)
 CDES.std.line.slope.pri.noAD<-(coef(lm(CDES.std.pri$D47.CDES.90.acc ~ CDES.std.pri$CDES.noAD.pri))[[2]]) #calculates slope of measured v accepted line btw standards
 CDES.std.line.intercept.pri.noAD<-(coef(lm(CDES.std.pri$D47.CDES.90.acc ~ CDES.std.pri$CDES.noAD.pri))[[1]]) #calcs intercept of measured v accepted standard line
@@ -405,6 +419,9 @@ data$CDES.ghosh.temp.stdcorr.pri.H <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDE
 
 data$CDES.ghosh.temp.pri.D <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.ADD.pri) #calculate temps from Acid corrected D47 values (Defliese AFF)
 data$CDES.ghosh.temp.stdcorr.pri.D <- convert_ARF.D47_to_ARF.Ghosh.temp(data$CDES.D47stdcorrD.pri) #calculate temps from Acid corrected (Defliese AFF) and carbonate standard corrected D47 values
+
+data$CDES.peterson.temp.pri <- convert_ARF.D47_to_ARF.Peterson.temp(data$CDES.ADP.pri) #calculate temps from Acid corrected D47 values (Peterson AFF)
+data$CDES.peterson.temp.stdcorr.pri <- convert_ARF.D47_to_ARF.Peterson.temp(data$CDES.D47stdcorrP.pri) #calculate temps from Acid corrected (Peterson AFF) and carbonate standard corrected D47 values
 
 data$CDES.Bonifacie.temp.pri <- convert_ARF.D47_to_ARF.Bonifacie.temp(data$CDES.noAD.pri) #calculate temps from Acid corrected D47 values (no AFF)
 data$CDES.Bonifacie.temp.stdcorr.pri <- convert_ARF.D47_to_ARF.Bonifacie.temp(data$CDES.D47stdcorr90.pri) #calculate temps from no Acid corrected values and carbonate standard corrected D47 values
@@ -584,7 +601,7 @@ CDESlines
 
 #### Comparison of standard residuals
 ```{r plot-compare.residuals, fig.width=14, fig.height=14}
-residual.comparison <- multiplot(CDES.residuals.pri.90, CDES.residuals.sec.bp.90, CDES.residuals.pri.D, CDES.residuals.sec.bp.D, CDES.residuals.pri.H, CDES.residuals.sec.bp.H, cols=3)
+residual.comparison <- multiplot(CDES.residuals.pri.90, CDES.residuals.sec.bp.90, cols=3)
 
 Std.res.all <- bind_rows(CDES.stdres.pri, CDES.stdres.sec)
   
@@ -592,37 +609,100 @@ write.csv(Std.res.all, file=paste0(session, "_CITstdresiduals.csv"))
 
 residual.comparison
 ```
+standard correcting bulk isotopes values
+```{r}
+bulk.stds.acc <- read.csv("bulkisostds.csv")
+
+bulk.stds <- data %>%
+  filter(D48excess.label!="D48 excess" & Donotuse != TRUE & Type=="standard" | Sample.ID == "NBS18") # make a subset of HG and EG with no analytical problems and no D48 excess
+
+bulk.stds <- left_join(bulk.stds, select(bulk.stds.acc, Sample.ID, d18O.acc, d13C.acc), by = "Sample.ID")
+```
+
+d13C discrimination correction - First, need to pick which correction scheme you prefer, then update this with the correct data columns
+```{r}
+# regression
+m.d13C <- lm(bulk.stds$d13C.acc ~ bulk.stds$d13C)
+disc.slopeC<-(coef(m.d13C)[[2]])
+disc.interC<-(coef(m.d13C)[[1]])
+R2 <- summary(m.d13C)$r.squared
+
+disc.plot.C <- ggplot(bulk.stds, aes(x=d13C, y = d13C.acc)) +
+  stat_smooth(method = "lm") +
+  geom_point(size = 3, shape = 21) +
+  theme_bw()
+
+disc.plot.C
+
+# apply correction to data
+data$d13C.disc.offset <- data$d13C - (disc.slopeC * data$d13C + disc.interC) #calculates offset values for all acid corrected values
+data$d13C.disc <- data$d13C - data$d13C.disc.offset 
+```
+
+18O discrimination correction - First, need to pick which correction scheme you prefer, then update this with the correct data columns
+```{r}
+# regression
+m.d18O <- lm(bulk.stds$d18O.acc ~ bulk.stds$d18O.VPDB.min)
+disc.slopeO<-(coef(m.d18O)[[2]])
+disc.interO<-(coef(m.d18O)[[1]])
+R2 <- summary(m.d18O)$r.squared
+
+disc.plot.O <- ggplot(bulk.stds, aes(x=d18O.VPDB.min, y = d18O.acc)) +
+  stat_smooth(method = "lm") +
+  geom_point(size = 3, shape = 21) +
+  theme_bw()
+
+disc.plot.O
+
+# apply correction to data
+data$d18O.disc.offset <- data$d18O.VPDB.min - (disc.slopeO * data$d18O.VPDB.min + disc.interO) #calculates offset values for all acid corrected values
+data$d18O.disc <- data$d18O.VPDB.min - data$d18O.disc.offset 
+```
+
+
+
 
 average reference data (standards, equilibrated gases), and plot D47,90 vs D48, 90 and compare to theoretical dual equilibrium line of Fiebig et al., 2019 (derived from Hill et al., 2014 Keq calculations for D63 and D64 of calcite)
 ```{r calc-avgs-plot47v48}
 
 data.avg <- data %>%
   group_by(Sample.ID) %>%
-  filter(D48excess.label == "no D48 excess" & Project == "all") %>%
-  summarise(N = n(),
-            d13C.se = sd(d13C)/sqrt(N),
-            d13C.avg = mean(d13C),
-            d18O.se = sd(d18O.VPDB.min)/sqrt(N),
-            d18O.avg = mean(d18O.VPDB.min),
-            D47.se = sd(CDES.D47stdcorr90.pri)/sqrt(N),
+  filter(D48excess.label != "D48 excess") %>%
+  summarise(Project = Project[1],
+            N = n(),
+            d13C.sd = sqrt(calc_wgt_variance(d13C.disc, d13C.sterr)),
+            d13C.se = d13C.sd/sqrt(N),
+            d13C.avg = calc_wgt_means(d13C.disc, d13C.sterr),
+            d18O.sd = sqrt(calc_wgt_variance(d18O.disc, d18O.sterr)),
+            d18O.se = d18O.sd/sqrt(N),
+            d18O.avg = calc_wgt_means(d18O.disc, d18O.sterr),
+            D47.sd = sqrt(calc_wgt_variance(CDES.noAD.pri, D47.HG.prop.err)),
+            D47.se = D47.sd/sqrt(N),
             D47.2se = 2*D47.se,
-            D47.90.noAD.avg = mean(CDES.noAD.pri),
-            D47.90.avg = mean(CDES.D47stdcorr90.pri),
-            D47.25D.avg = mean(CDES.D47stdcorrD.pri),
-            D48.se = sd(CDES.48noAD.pri)/sqrt(N),
+            D47.90.noAD.avg = calc_wgt_means(CDES.noAD.pri, D47.HG.prop.err),
+            D47.90.avg = calc_wgt_means(CDES.D47stdcorr90.pri, D47.HG.prop.err),
+            D47.25D.avg = calc_wgt_means(CDES.D47stdcorrD.pri, D47.HG.prop.err),
+            D47.25P.avg = calc_wgt_means(CDES.D47stdcorrP.pri, D47.HG.prop.err),
+            D48.sd = sqrt(calc_wgt_variance(CDES.48noAD.pri, D48.sterr)),
+            D48.se = D48.sd/sqrt(N),
             D48.2se = 2*D48.se,
-            D48.90.avg = mean(CDES.48noAD.pri),
-            D48.se.all = sd(CDES.48noAD.pri.all)/sqrt(N),
+            D48.90.avg = calc_wgt_means(CDES.48noAD.pri, D48.sterr),
+            D48.sd.all = sqrt(calc_wgt_variance(CDES.48noAD.pri.all, D48.sterr)),
+            D48.se.all = D48.sd.all/sqrt(N),
             D48.2se.all = 2*D48.se.all,
-            D48.90.avg.all = mean(CDES.48noAD.pri.all),
+            D48.90.avg.all = calc_wgt_means(CDES.48noAD.pri.all, D48.sterr),
             T.B = convert_ARF.D47_to_ARF.Ghosh.temp(D47.90.avg),
             T.B.se = calc_D47.Temp_se(T.B, D47.90.avg, D47.se),
             T.G = convert_ARF.D47_to_ARF.Ghosh.temp(D47.25D.avg),
             T.G.se = calc_D47.Temp_se(T.B, D47.25D.avg, D47.se),
+            T.P = convert_ARF.D47_to_ARF.Ghosh.temp(D47.25P.avg),
+            T.P.se = calc_D47.Temp_se(T.P, D47.25P.avg, D47.se),
             d18Ow.B = calc_d18Ow(d18O.avg, T.B),
             d18Ow.B.se = calc_d18Owse(d18O.avg, d18O.se, T.B, T.B.se),
             d18Ow.G = calc_d18Ow(d18O.avg, T.G),
-            d18Ow.G.se = calc_d18Owse(d18O.avg, d18O.se, T.G, T.G.se))
+            d18Ow.G.se = calc_d18Owse(d18O.avg, d18O.se, T.G, T.G.se),
+            d18Ow.P = calc_d18Ow(d18O.avg, T.P),
+            d18Ow.P.se = calc_d18Owse(d18O.avg, d18O.se, T.P, T.P.se))
 
 pD47vD48 <- ggplot(data = data.frame(x=c(0.1, 0.7)), aes(x)) +
   stat_function(fun = function(x) {0.1829*(x^2) + 0.2138*(x) - 0.0139}, colour = "light gray") +
@@ -670,28 +750,30 @@ write.csv(data, file=paste0(session, "_brandcorr_reprocessed.csv"))
 Can subdivide the dataset into individual projects, each with all of the "all" data, to use for supplemental files for different projects. To use, you'll need to manually update the separate project dataframe names and filtering criteria, and then the worksheet labels accordingly
 ```{r diff-projects}
 
-# unique(data$Project)
-# data.nozero <- data %>%
-#   filter(Sample.ID != "zero")
-# 
-# RS <- data.nozero %>%
-#   filter(Project == "all" | Project =="RS")
-# 
-# Thomas <- data.nozero %>%
-#   filter(Project == "all" | Project =="Thomas")
-# 
-# Layzell <- data.nozero %>%
-#   filter(Project == "all" | Project =="Layzell")
-# 
-# add_ws_with_data <- function(wb, sheet, data) {
-#   addWorksheet(wb, sheet)
-#   writeData(wb, sheet=sheet, data)
-#   return(wb)
-# }
-# 
-# wb <- createWorkbook("data") 
-# wb <- add_ws_with_data(wb, "all data", data)
-# wb <- add_ws_with_data(wb, "RS", RS)
-# wb <- add_ws_with_data(wb, "Thomas", Thomas)
-# wb <- add_ws_with_data(wb, "Layzell", Thomas)
-# saveWorkbook(wb, paste0(session, "_flatlist_project.xlsx"), overwrite = TRUE)
+Supp.table <- data %>%
+  filter(Project == "Marina" | Project == "all") %>%
+  select(Date, Sample.ID, Type, Donotuse, runinfo, spec.num, mass, num.acq, d45,d45.stdev,d45.sterr,d46,d46.stdev,d46.sterr,d47,d47.stdev,d47.sterr,d48,d48.stdev,d48.sterr,d49,d49.stdev,D47,D47.stdev,D47.sterr,D48,D48.stdev,D48.sterr,d13C,d13C.stdev,d13C.sterr,d18O.VPDB.min,d18O.stdev,d18O.sterr,D48.HGcorr,D48excess.label, HGcorr, D47.HG.prop.err,CDES.noAD.pri,CDES.D47stdcorr90.pri, CDES.ADP.pri,CDES.D47stdcorrP.pri,CDES.ghosh.temp.pri.D,CDES.peterson.temp.stdcorr.pri,CDES.Bonifacie.temp.pri)
+
+samples <- data %>%
+  filter(Project == "Marina") %>%
+  select(Date, Sample.ID, Type, Donotuse, runinfo, spec.num, mass, num.acq, d45,d45.stdev,d45.sterr,d46,d46.stdev,d46.sterr,d47,d47.stdev,d47.sterr,d48,d48.stdev,d48.sterr,d49,d49.stdev,D47,D47.stdev,D47.sterr,D48,D48.stdev,D48.sterr,d13C,d13C.stdev,d13C.sterr,d18O.VPDB.min,d18O.stdev,d18O.sterr,D48.HGcorr,D48excess.label, HGcorr, D47.HG.prop.err,CDES.noAD.pri,CDES.D47stdcorr90.pri, CDES.ADP.pri,CDES.D47stdcorrP.pri,CDES.ghosh.temp.pri.D,CDES.peterson.temp.stdcorr.pri,CDES.Bonifacie.temp.pri)
+
+
+Averages <- data.avg %>%
+  filter(Project == "all" | Project == "Marina" | Project == "int.standards")
+
+add_ws_with_data <- function(wb, sheet, data) {
+  addWorksheet(wb, sheet)
+  writeData(wb, sheet=sheet, data)
+  return(wb)
+}
+
+wb <- createWorkbook("data")
+wb <- add_ws_with_data(wb, "all data", data)
+wb <- add_ws_with_data(wb, "all supp info", Supp.table)
+wb <- add_ws_with_data(wb, "all replicates", samples)
+wb <- add_ws_with_data(wb, "Averages", Averages)
+saveWorkbook(wb, paste0(session, "_flatlist_project.xlsx"), overwrite = TRUE)
+```
+
+
